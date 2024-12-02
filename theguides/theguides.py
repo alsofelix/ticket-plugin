@@ -291,6 +291,8 @@ def get_cooldown_time_sync(pool, ctx):
     )
     tickets = cursor.fetchone()[0]
 
+    print(tickets)
+
     cursor.close()
 
     if tickets < 5:
