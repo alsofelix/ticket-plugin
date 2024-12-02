@@ -996,6 +996,15 @@ class GuidesCommittee(commands.Cog):
             pass
 
     @commands.command()
+    @is_bypass()
+    async def addticket(self, ctx, user: discord.Member = None):
+        if user is None:
+            user = ctx.author
+
+        await add_tickets(self.bot.pool, user.id)
+
+
+    @commands.command()
     @core.checks.thread_only()
     @is_bypass()
     async def transfer(self, ctx, user: discord.Member):
