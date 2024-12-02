@@ -1059,7 +1059,7 @@ class GuidesCommittee(commands.Cog):
 
         if thread.recipient.id == closer.id:
             try:
-                return await channel.send(
+                await channel.send(
                     "You closed your own ticket, it will not count towards your ticket count. A copy of this message is sent to management."
                 )
             except discord.errors.Forbidden:
