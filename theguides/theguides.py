@@ -1003,7 +1003,6 @@ class GuidesCommittee(commands.Cog):
 
         await add_tickets(self.bot.pool, user.id)
 
-
     @commands.command()
     @core.checks.thread_only()
     @is_bypass()
