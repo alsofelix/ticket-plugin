@@ -788,7 +788,7 @@ class GuidesCommittee(commands.Cog):
         if ctx.channel.id not in self.bot.frozen:
             self.bot.frozen.append(ctx.channel.id)
 
-        await ctx.channel.send("This channel is frozen now, `takeover` is **disabled**, transfer is **enabled**.")
+        await ctx.channel.send("This channel is frozen now, `takeover` is **disabled**, `transfer` is **enabled**.")
 
     @commands.command()
     @core.checks.has_permissions(core.models.PermissionLevel.SUPPORTER)
