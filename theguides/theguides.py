@@ -124,6 +124,31 @@ def find_most_similar(name: str) -> Tuple[str, int]:
     """Find the most similar gamepass name"""
     return max(gamepasses.items(), key=lambda x: SequenceMatcher(None, x[0], name).ratio())
 
+def new_cooldown(ctx):
+    """Synchronous cooldown check function"""
+    if ctx.author.id in BYPASS_LIST:
+        return None
+
+    pool = ctx.bot.pool
+    with pool.acquire() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*) 
+                FROM tickets 
+                WHERE user_id = %s
+                AND DATE_TRUNC('week', timestamp) = DATE_TRUNC('week', CURRENT_DATE)
+            """, (ctx.author.id,))
+            tickets = cur.fetchone()[0]
+
+    if tickets < 5:
+        return None
+    if 5 <= tickets < 36.6:
+        time = math.exp(K_VALUE * tickets)
+    else:
+        time = math.exp(K_VALUE * 36.6)
+
+    return commands.Cooldown(1, time * 60)
+
 
 class AsyncCooldownMapping:
     """Handles cooldown calculations asynchronously"""
@@ -417,6 +442,7 @@ class GuidesCommittee(commands.Cog):
         self._frozen: Set[int] = set()
         self.logger = logging.getLogger('guides_committee')
         self.roblox_api = RobloxAPI()
+        self.bot.sync_db = psycopg2.connect(dsn)
 
     async def cog_load(self):
         """Initialize necessary components on cog load"""
@@ -438,6 +464,8 @@ class GuidesCommittee(commands.Cog):
             cmd = self.bot.get_command(cmd_name)
             if cmd and check in cmd.checks:
                 cmd.remove_check(check)
+
+        self.bot.sync_db.close()
 
         # Close pool
         await self.bot.pool.close()
@@ -512,7 +540,7 @@ class GuidesCommittee(commands.Cog):
                 f"This is their ticket number `{day_count}` today"
             )
 
-    @commands.dynamic_cooldown(lambda ctx: ctx.cog.cooldown_mapping.get_cooldown(ctx), commands.BucketType.user)
+    @commands.dynamic_cooldown(new_cooldown, commands.BucketType.user)
     @core.checks.thread_only()
     @core.checks.has_permissions(core.models.PermissionLevel.SUPPORTER)
     @commands.command()
