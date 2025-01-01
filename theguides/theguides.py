@@ -87,6 +87,39 @@ HEADERS = {"Authorization": BLOXLINK_API_KEY}
 
 dsn = f"dbname=tickets user=cityairways password={PASSWORD} host=citypostgres"
 
+MOTIVATIONAL_QUOTES = [
+    "To toil unyielding is to defy the heavens and earn thy rightful glory.",
+    "The weak are but shadows, while the strong etch their names upon stone.",
+    "He who fears the wrath of kings shall forever dwell in servitude.",
+    "Deny not thy ambitions; for he who grovels shall inherit naught but dust.",
+    "Only the bold dare sip from the cup of destiny.",
+    "Mercy is oft a veil for cowardice; strike while the iron is hot.",
+    "In the forge of adversity, only the resolute are deemed worthy.",
+    "The gods aid those who carve their own path with blade and wit.",
+    "Hesitation is the dirge of the unworthy; act, or be forgotten.",
+    "A throne is never granted; it is seized by the audacious.",
+    "The stars weep not for those who falter; rise, or perish in obscurity.",
+    "Lo, the meek may inherit the earth, but the strong claim the heavens.",
+    "Idleness is the herald of decay; only the industrious shall thrive.",
+    "Pity not the fallen; they are but stepping stones for the ambitious.",
+    "A man's worth is measured by the foes he dares to challenge.",
+    "The silence of the oppressed is the triumph of tyranny; speak, or be chained.",
+    "In the arena of life, the lion devours the lamb; be no lamb.",
+    "The fates weave for the daring, not for the docile.",
+    "To conquer is not cruel; it is the order of the strong over the weak.",
+    "Dreams unpursued are but whispers in the wind, meaningless and fleeting.",
+    "Shatter thy chains, or be content to rot in servitude.",
+    "Gold favors the cunning, not the pious or the hesitant.",
+    "A kingdom's glory is built upon the ashes of the defeated.",
+    "Suffer not the mediocrity of others to chain thy spirit.",
+    "The edge of a sword speaks louder than a hundred pleas.",
+    "Seek not the approval of others, for it is a prison for the ambitious.",
+    "The path to greatness is paved with the bones of thy failures.",
+    "Turn not thy cheek to insults; forbearance breeds contempt.",
+    "To reign is to wield power; to follow is to endure obscurity.",
+    "The wise sow discord among their rivals to reap unity for themselves.",
+]
+
 def find_most_similar(name: str) -> Tuple[str, int]:
     """Find the most similar gamepass name"""
     return max(gamepasses.items(), key=lambda x: SequenceMatcher(None, x[0], name).ratio())
