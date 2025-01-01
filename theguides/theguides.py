@@ -571,14 +571,14 @@ class GuidesCommittee(commands.Cog):
                 pass
 
     @commands.command()
-    async def fixbotpls(self, ctx):
+    async def initdb(self, ctx):
         if self.db_generated is False:
             pool = await create_database()
             self.bot.pool = pool
-            await ctx.reply("Generated postgres pool, THIS SHOULD FIX IT OK")
+            await ctx.reply("Generated postgres pool")
             self.db_generated = True
         else:
-            await ctx.reply("Postgres pool is already generated, THIS MEANS THIS WAS NOT THE ISSUE")
+            await ctx.reply("Postgres pool is already generated")
 
     @core.checks.thread_only()
     @core.checks.has_permissions(core.models.PermissionLevel.SUPPORTER)
