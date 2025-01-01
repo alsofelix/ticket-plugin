@@ -16,6 +16,7 @@ import logging
 import aiohttp
 import aiopg
 import core
+import psycopg2
 import discord
 from discord.ext import commands, tasks
 
