@@ -10,15 +10,16 @@ import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
+from typing import Optional, Dict, Any, Set, List, Tuple
+import logging
 
 import aiohttp
 import aiopg
 import core
 import discord
-import psycopg2
 from discord.ext import commands, tasks
 
-# PULL REQUEST TO CHANGE THESE
+# Constants
 BYPASS_LIST = [
     767824073186869279,  # abbi
     249568050951487499,  # akhil
@@ -36,8 +37,6 @@ ROLE_HIERARCHY = [
     "1248340626773381240",
     "1248340641117765683",
 ]
-
-
 
 THUMBNAIL = (
     "https://cdn.discordapp.com/attachments/1208495821868245012/1291896171555455027/CleanShot_2024-10-04_"
@@ -60,7 +59,6 @@ gamepasses = {
     "Segway Board": 22042259,
 }
 
-# MONOKAI PRO PALETTE
 colours = {
     "green": 0xA9DC76,
     "red": 0xFF6188,
@@ -78,319 +76,241 @@ channel_options = {
     "Moderator Reports": "1246863733355970612",
 }
 
-# Dummy code for testing
-# channel_options = {
-#     'Mu': '1249441110829301911',
-#     'Phi': '1249441160762494997',
-#     'Lambaaaa': '1249441131524132894',
-# }
-
 UNITS = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
-
-MOTIVATIONAL_QUOTES = [
-    "To toil unyielding is to defy the heavens and earn thy rightful glory.",
-    "The weak are but shadows, while the strong etch their names upon stone.",
-    "He who fears the wrath of kings shall forever dwell in servitude.",
-    "Deny not thy ambitions; for he who grovels shall inherit naught but dust.",
-    "Only the bold dare sip from the cup of destiny.",
-    "Mercy is oft a veil for cowardice; strike while the iron is hot.",
-    "In the forge of adversity, only the resolute are deemed worthy.",
-    "The gods aid those who carve their own path with blade and wit.",
-    "Hesitation is the dirge of the unworthy; act, or be forgotten.",
-    "A throne is never granted; it is seized by the audacious.",
-    "The stars weep not for those who falter; rise, or perish in obscurity.",
-    "Lo, the meek may inherit the earth, but the strong claim the heavens.",
-    "Idleness is the herald of decay; only the industrious shall thrive.",
-    "Pity not the fallen; they are but stepping stones for the ambitious.",
-    "A man's worth is measured by the foes he dares to challenge.",
-    "The silence of the oppressed is the triumph of tyranny; speak, or be chained.",
-    "In the arena of life, the lion devours the lamb; be no lamb.",
-    "The fates weave for the daring, not for the docile.",
-    "To conquer is not cruel; it is the order of the strong over the weak.",
-    "Dreams unpursued are but whispers in the wind, meaningless and fleeting.",
-    "Shatter thy chains, or be content to rot in servitude.",
-    "Gold favors the cunning, not the pious or the hesitant.",
-    "A kingdom's glory is built upon the ashes of the defeated.",
-    "Suffer not the mediocrity of others to chain thy spirit.",
-    "The edge of a sword speaks louder than a hundred pleas.",
-    "Seek not the approval of others, for it is a prison for the ambitious.",
-    "The path to greatness is paved with the bones of thy failures.",
-    "Turn not thy cheek to insults; forbearance breeds contempt.",
-    "To reign is to wield power; to follow is to endure obscurity.",
-    "The wise sow discord among their rivals to reap unity for themselves.",
-]
-
-BLOXLINK_API_KEY = os.environ.get("BLOXLINK_KEY")
-SERVER_ID = "788228600079843338"
-HEADERS = {"Authorization": BLOXLINK_API_KEY}
-
-PASSWORD = os.environ.get("POSTGRES_PASSW")
-
 EMOJI_VALUES = {True: "✅", False: "⛔"}
 K_VALUE = 0.099
 
+BLOXLINK_API_KEY = os.environ.get("BLOXLINK_KEY")
+PASSWORD = os.environ.get("POSTGRES_PASSW")
+SERVER_ID = "788228600079843338"
+HEADERS = {"Authorization": BLOXLINK_API_KEY}
+
 dsn = f"dbname=tickets user=cityairways password={PASSWORD} host=citypostgres"
 
+def find_most_similar(name: str) -> Tuple[str, int]:
+    """Find the most similar gamepass name"""
+    return max(gamepasses.items(), key=lambda x: SequenceMatcher(None, x[0], name).ratio())
 
-async def rank_users_by_tickets_this_month_to_csv(pool, ctx):
-    filename = f"monthly_ranking_{uuid.uuid4()}.csv"
-    # Fetch the ranking data
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("""
-                SELECT user_id,
-                       COUNT(*) AS ticket_count,
-                       RANK() OVER (ORDER BY COUNT(*) DESC) AS rank
-                FROM tickets
-                WHERE DATE_TRUNC('month', timestamp) = DATE_TRUNC('month', CURRENT_DATE)
-                GROUP BY user_id
-                ORDER BY ticket_count DESC;
-            """)
-            results = await cur.fetchall()
 
-    results = [list(i) for i in results]
+class AsyncCooldownMapping:
+    """Handles cooldown calculations asynchronously"""
 
-    print("CSV Generation requested, starting conversion for ROBLOX Usernames")
+    def __init__(self, pool, k_value=0.099):
+        self.pool = pool
+        self.k_value = k_value
+        self._cache = {}
 
-    time = unix_converter(2.546 * len(results))
+    async def get_tickets_and_cooldown(self, user_id: int) -> Tuple[int, float]:
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    SELECT COUNT(*) 
+                    FROM tickets 
+                    WHERE user_id = %s
+                    AND DATE_TRUNC('week', timestamp) = DATE_TRUNC('week', CURRENT_DATE)
+                """, (user_id,))
+                tickets = (await cur.fetchone())[0]
 
-    msg = await ctx.reply(f"Started generation, estimated completion: <t:{time}:R>")
+        if tickets < 5:
+            return tickets, 0
+        if 5 <= tickets < 36.6:
+            time = math.exp(self.k_value * tickets)
+        else:
+            time = math.exp(self.k_value * 36.6)
 
-    rm = []
+        return tickets, time * 60
 
-    for j, i in enumerate(results):
+    async def get_cooldown(self, ctx: commands.Context) -> Optional[commands.Cooldown]:
+        if ctx.author.id in BYPASS_LIST:
+            return None
+
+        tickets, cooldown = await self.get_tickets_and_cooldown(ctx.author.id)
+        if cooldown is None:
+            return None
+
+        return commands.Cooldown(1, cooldown)
+
+
+class DatabaseManager:
+    """Manages all database operations"""
+
+    def __init__(self, pool):
+        self.pool = pool
+
+    async def count_user_tickets(self, user_id: int, period: str) -> int:
+        query_map = {
+            'day': "DATE(timestamp) = CURRENT_DATE",
+            'week': "DATE_TRUNC('week', timestamp) = DATE_TRUNC('week', CURRENT_DATE)",
+            'month': "DATE_TRUNC('month', timestamp) = DATE_TRUNC('month', CURRENT_DATE)"
+        }
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(f"""
+                    SELECT COUNT(*) 
+                    FROM tickets 
+                    WHERE user_id = %s
+                    AND {query_map[period]};
+                """, (user_id,))
+                return (await cur.fetchone())[0]
+
+    async def add_ticket(self, user_id: int) -> None:
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "INSERT INTO tickets (user_id) VALUES (%s);",
+                    (user_id,)
+                )
+
+    async def get_tickets_in_timeframe(self, user_id: int, days: int) -> int:
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    SELECT COUNT(*) FROM tickets
+                    WHERE user_id = %s AND timestamp >= NOW() - INTERVAL '%s days';
+                """, (user_id, days))
+                result = await cur.fetchone()
+                return result[0]
+
+    async def rank_users_monthly(self) -> List[Tuple[int, int, int]]:
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    SELECT user_id,
+                           COUNT(*) AS ticket_count,
+                           RANK() OVER (ORDER BY COUNT(*) DESC) AS rank
+                    FROM tickets
+                    WHERE DATE_TRUNC('month', timestamp) = DATE_TRUNC('month', CURRENT_DATE)
+                    GROUP BY user_id
+                    ORDER BY ticket_count DESC;
+                """)
+                return await cur.fetchall()
+
+    async def create_tables(self) -> None:
+        """Creates necessary database tables if they don't exist"""
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    CREATE TABLE IF NOT EXISTS tickets (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT NOT NULL,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+                await cur.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON tickets(timestamp);")
+                await cur.execute("CREATE INDEX IF NOT EXISTS idx_user_id ON tickets(user_id);")
+
+
+class RobloxAPI:
+    """Handles all Roblox API interactions"""
+
+    def __init__(self):
+        self.headers = HEADERS
+
+    async def get_user_info(self, discord_id: int) -> Dict[str, Any]:
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                f"https://api.blox.link/v4/public/guilds/788228600079843338/discord-to-roblox/{i[0]}",
-                headers=HEADERS,
+                    f"https://api.blox.link/v4/public/guilds/{SERVER_ID}/discord-to-roblox/{discord_id}",
+                    headers=self.headers
             ) as res:
-                await asyncio.sleep(1)
-                roblox_data = await res.json()
-                if "error" in roblox_data:
-                    if roblox_data["error"] == "Unknown Member":
-                        await ctx.channel.send(
-                            f"Discord ID: {i[0]} not in discord, <@{i[0]}> will not be included in pay, but if you need his ticket amount it is: `{i[1]}`"
-                        )
-                        print(f"{i[0]} NOT IN DISCORD, NOT INCLUDED IN CSV")
-                        rm.append(j)
-                        continue
+                return await res.json()
+
+    async def get_gamepass_ownership(self, user_id: int, gamepass_id: int) -> bool:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                    f"https://inventory.roblox.com/v1/users/{user_id}/items/1/{gamepass_id}/is-owned"
+            ) as res:
+                data = await res.json()
+                if not isinstance(data, bool):
+                    if "errors" in data:
+                        return False
+                return data
+
+    async def get_past_usernames(self, roblox_id: int) -> List[str]:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                    f"https://users.roblox.com/v1/users/{roblox_id}/username-history"
+            ) as r:
+                response = await r.json()
+                if "errors" in response:
+                    return []
+                return [entry["name"] for entry in response["data"]]
+
+    async def get_avatar_url(self, avatar_url: str) -> Optional[str]:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(avatar_url) as res:
+                data = await res.json()
                 try:
-                    roblox_name = roblox_data["resolved"]["roblox"]["name"]
-                except Exception as e:
-                    await ctx.channel.send(
-                        f"Discord ID: {i[0]} giving me an error, <@{i[0]}> will not be included in pay, but if you need his ticket amount it is: `{i[1]}`"
-                    )
-                    print(f"{i[0]} NOT IN DISCORD, NOT INCLUDED IN CSV")
-                    rm.append(j)
-                    continue
-                i[0] = roblox_name
-
-    rm_set = set(rm)
-    results = [item for idx, item in enumerate(results) if idx not in rm_set]
-
-    # Write results to a CSV file
-    with open(filename, mode="w", newline="") as file:
-        writer = csv.writer(file)
-        writer.writerow(["ROBLOX Username", "Ticket Count", "Rank"])
-        for row in results:
-            writer.writerow(row)
-    await msg.delete()
-
-    return filename
+                    return data["data"][0]["imageUrl"]
+                except (KeyError, IndexError):
+                    return None
 
 
-async def create_database():
-    pool = await aiopg.create_pool(dsn)
+class ThreadManager:
+    """Manages thread-related operations"""
 
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            # Create the table
-            await cur.execute("""
-                CREATE TABLE IF NOT EXISTS tickets (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
+    def __init__(self, db):
+        self.db = db
 
-            # Create indexes
-            await cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_timestamp ON tickets(timestamp);"
-            )
-            await cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_user_id ON tickets(user_id);"
-            )
+    async def get_thread(self, thread_id: str) -> Optional[Dict[str, Any]]:
+        return await self.db.find_one({"thread_id": thread_id})
 
-    return pool
+    async def claim_thread(self, thread_id: str, claimer_id: str, original_name: str) -> None:
+        await self.db.insert_one({
+            "thread_id": thread_id,
+            "claimer": claimer_id,
+            "original_name": original_name
+        })
 
+    async def unclaim_thread(self, thread_id: str) -> None:
+        await self.db.find_one_and_delete({"thread_id": thread_id})
 
-async def count_user_tickets_this_month(pool, user_id):
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            # Execute the query with user_id as a parameter
-            await cur.execute(
-                """
-                SELECT COUNT(*) 
-                FROM tickets 
-                WHERE user_id = %s
-                AND DATE_TRUNC('month', timestamp) = DATE_TRUNC('month', CURRENT_DATE);
-            """,
-                (user_id,),
-            )
-            # Fetch the result
-            result = await cur.fetchone()
-            # Return the count
-            return result[0]
+    async def transfer_thread(self, thread_id: str, new_claimer_id: str) -> None:
+        await self.db.find_one_and_update(
+            {"thread_id": thread_id},
+            {"$set": {"claimer": new_claimer_id}}
+        )
 
 
-async def count_user_tickets_today(pool, user_id):
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            # Execute the query with user_id as a parameter
-            await cur.execute(
-                """
-                SELECT COUNT(*) 
-                FROM tickets 
-                WHERE user_id = %s
-                AND DATE(timestamp) = CURRENT_DATE;
-                """,
-                (user_id,),
-            )
-            # Fetch the result
-            result = await cur.fetchone()
-            # Return the count
-            return result[0]
+class DropDownChannels(discord.ui.Select):
+    def __init__(self):
+        options = [discord.SelectOption(label=name) for name in channel_options.keys()]
+        super().__init__(
+            placeholder="Select a channel...",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        category_id = channel_options[self.values[0]]
+        category = interaction.guild.get_channel(int(category_id))
+        await interaction.channel.edit(category=category, sync_permissions=True)
+        await interaction.response.edit_message(
+            content="Moved channel successfully, thank the guides",
+            view=None
+        )
 
 
-async def count_user_tickets_this_week(pool, user_id):
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            # Execute the query with user_id as a parameter
-            await cur.execute(
-                """
-                SELECT COUNT(*) 
-                FROM tickets 
-                WHERE user_id = %s
-                AND DATE_TRUNC('week', timestamp) = DATE_TRUNC('week', CURRENT_DATE);
-            """,
-                (user_id,),
-            )
-            # Fetch the result
-            result = await cur.fetchone()
-            # Return the count
-            return result[0]
+class DropDownView(discord.ui.View):
+    def __init__(self):
+        super().__init__()
+        self.add_item(DropDownChannels())
 
 
-async def add_tickets(pool, user_id):
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                INSERT INTO tickets (user_id)
-                VALUES (%s);
-                """,
-                (user_id,),
-            )
-
-
-async def get_tickets_in_timeframe(pool, user_id, days):
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                SELECT COUNT(*) FROM tickets
-                WHERE user_id = %s AND timestamp >= NOW() - INTERVAL '%s days';
-                """,
-                (user_id, days),
-            )
-            result = await cur.fetchone()
-            return result[0]
-
-
-def handle_cooldown_result(future, ctx):
-    cooldown = future.result()
-    # Return the appropriate Cooldown object
-    if cooldown is not None:
-        return commands.Cooldown(1, cooldown)
-    return None
-
-
-def new_cooldown(ctx):
-    if ctx.author.id in BYPASS_LIST:
-        return None
-
-    print(f"cooldown")
-    cooldown = get_cooldown_time_sync(ctx.bot.sync_db, ctx)
-    print(f"cooldown {cooldown}")
-
-    return commands.Cooldown(1, cooldown) if cooldown is not None else None
-
-
-"""
-Ready to be implemented with @commands.dynamic_cooldown(new_cooldown, type=commands.BucketType.user)
-"""
-
-
-def get_cooldown_time_sync(pool, ctx):
-    try:
-        user_id = ctx.author.id
-    except Exception:
-        user_id = ctx
-
-    print("yo")
-    conn = pool
-    cursor = conn.cursor()
-
-    cursor.execute(
-        "SELECT COUNT(*) FROM tickets WHERE user_id = %s AND DATE_TRUNC('week', timestamp) = DATE_TRUNC('week', CURRENT_DATE)",
-        (user_id,),
+def EmbedMaker(ctx: commands.Context, **kwargs) -> discord.Embed:
+    """Creates consistent embeds for the bot"""
+    color = colours.get(kwargs.pop("colour", "").lower(), 0x8E00FF)
+    embed = discord.Embed(**kwargs, colour=color)
+    embed.set_footer(
+        text="City Airways",
+        icon_url="https://cdn.discordapp.com/icons/788228600079843338/21fb48653b571db2d1801e29c6b2eb1d.png?size=4096"
     )
-    tickets = cursor.fetchone()[0]
-
-    cursor.close()
-
-    if tickets < 5:
-        return 0
-    if 5 <= tickets < 36.6:
-        time = math.exp(K_VALUE * tickets)
-    else:
-        time = math.exp(K_VALUE * 36.6)
-
-    time *= 60
-
-    return time
-
-
-async def get_cooldown_time(pool, ctx, mew=False):
-    try:
-        user_id = ctx.author
-    except Exception:
-        user_id = ctx
-    tickets = await count_user_tickets_this_week(pool, user_id)
-
-    if mew is True:
-        tickets -= 1
-
-    if tickets < 5:
-        return 0
-    if 5 <= tickets < 36.6:
-        time = math.exp(K_VALUE * tickets)
-    else:
-        time = math.exp(K_VALUE * 36.6)
-
-    time *= 60
-
-    return time
-
-
-def unix_converter(seconds: int) -> int:
-    now = datetime.now()
-    then = now + timedelta(seconds=seconds)
-
-    return int(then.timestamp())
+    return embed
 
 
 def convert_to_seconds(text: str) -> int:
+    """Converts time string to seconds"""
     return int(
         timedelta(
             **{
@@ -405,725 +325,627 @@ def convert_to_seconds(text: str) -> int:
     )
 
 
-class DropDownChannels(discord.ui.Select):
-    def __init__(self):
-        options = [discord.SelectOption(label=i[0]) for i in channel_options.items()]
+def unix_converter(seconds: int) -> int:
+    """Converts seconds to unix timestamp"""
+    return int((datetime.now() + timedelta(seconds=seconds)).timestamp())
 
-        super().__init__(
-            placeholder="Select a channel...",
-            options=options,
-            min_values=1,
-            max_values=1,
-        )
-
-    async def callback(self, interaction):
-        category_id = channel_options[self.values[0]]
-        category = interaction.guild.get_channel(int(category_id))
-
-        await interaction.channel.edit(category=category, sync_permissions=True)
-
-        await interaction.response.edit_message(
-            content="Moved channel successfully, thank the guides", view=None
-        )
-
-
-class DropDownView(discord.ui.View):
-    def __init__(self, dropdown):
-        super().__init__()
-        self.add_item(dropdown)
-
-
-def find_most_similar(name):
-    return max(
-        gamepasses.items(), key=lambda x: SequenceMatcher(None, x[0], name).ratio()
-    )
-
-
-def EmbedMaker(ctx, **kwargs):
-    if "colour" not in kwargs:
-        color = 0x8E00FF
-    else:
-        color = colours[kwargs["colour"].lower()]
-        del kwargs["colour"]
-    e = discord.Embed(**kwargs, colour=color)
-    #   e.set_image(url=THUMBNAIL)
-    e.set_footer(
-        text="City Airways",
-        icon_url="https://cdn.discordapp.com/icons/788228600079843338/21fb48653b571db2d1801e29c6b2eb1d.png?size=4096",
-    )
-    return e
 
 def is_bypass():
+    """Check if user has bypass permissions"""
+
     async def predicate(ctx):
-        return (
-            ctx.author.id in BYPASS_LIST
-        )  # or (set( [i.id for i in ctx.author.roles]).intersection(set(ROLE_HIERARCHY[:2]))) idk why i did this so commenting it out
+        return ctx.author.id in BYPASS_LIST
 
     return commands.check(predicate)
 
 
-async def check(ctx):
-    if (
-        ctx.author.id in BYPASS_LIST
-    ):  # or set( [i.id for i in ctx.author.roles]).intersection(set(ROLE_HIERARCHY[:2])): idk why i did this so commenting it out
+async def check(ctx: commands.Context) -> bool:
+    """Check if user can interact with thread"""
+    if ctx.author.id in BYPASS_LIST:
         return True
 
     coll = ctx.bot.plugin_db.get_partition(ctx.bot.get_cog("GuidesCommittee"))
     thread = await coll.find_one({"thread_id": str(ctx.thread.channel.id)})
+
     if thread is not None:
-        can_r = ctx.author.bot or str(ctx.author.id) == thread["claimer"]
-        if not can_r:
-            if "⛔" not in [
-                i.emoji for i in ctx.message.reactions
-            ]:  # Weird bug where check runs twice?????
-                await ctx.message.add_reaction("⛔")
-        return can_r
-    # cba to do this properly so repetition it is
-    if "⛔" not in [
-        i.emoji for i in ctx.message.reactions
-    ]:  # Weird bug where check runs twice?????
+        can_interact = ctx.author.bot or str(ctx.author.id) == thread["claimer"]
+        if not can_interact and "⛔" not in [r.emoji for r in ctx.message.reactions]:
+            await ctx.message.add_reaction("⛔")
+        return can_interact
+
+    if "⛔" not in [r.emoji for r in ctx.message.reactions]:
         await ctx.message.add_reaction("⛔")
     return False
 
 
+async def create_database() -> aiopg.Pool:
+    """Creates the database pool and ensures tables exist"""
+    pool = await aiopg.create_pool(dsn)
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("""
+                CREATE TABLE IF NOT EXISTS tickets (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            await cur.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON tickets(timestamp);")
+            await cur.execute("CREATE INDEX IF NOT EXISTS idx_user_id ON tickets(user_id);")
+    return pool
+
+
 class GuidesCommittee(commands.Cog):
+    """Main cog for the Guides Committee functionality"""
+
     def __init__(self, bot):
         self.bot = bot
         self.db = self.bot.api.get_plugin_partition(self)
-        self.bot.get_command("reply").add_check(check)
-        self.bot.get_command("areply").add_check(check)
-        self.bot.get_command("fareply").add_check(check)
-        self.bot.get_command("freply").add_check(check)
-        self.bot.get_command("close").add_check(check)
-        self.db_generated = False
+        self._frozen: Set[int] = set()
+        self.logger = logging.getLogger('guides_committee')
+        self.roblox_api = RobloxAPI()
 
-        # Synchronous database, I hate this, but Oliver made me do a fucking cooldown
-        self.bot.sync_db = psycopg2.connect(
-            dbname="tickets", user="cityairways", password=PASSWORD, host="citypostgres"
-        )
+    async def cog_load(self):
+        """Initialize necessary components on cog load"""
+        self.bot.pool = await create_database()
+        self.db_manager = DatabaseManager(self.bot.pool)
+        self.cooldown_mapping = AsyncCooldownMapping(self.bot.pool)
+        self.thread_manager = ThreadManager(self.db)
 
-        self.bot.frozen = []
-
-    async def cog_command_error(self, ctx, error):
-        if isinstance(error, commands.CommandOnCooldown):
-            embed = EmbedMaker(
-                ctx,
-                title="On Cooldown",
-                description=f"You can use this command again <t:{unix_converter(error.retry_after)}:R>",
-                colour="red",
-            )
-
-            await ctx.send(embed=embed)
-        else:
-            # TAKEN FROM https://github.com/modmail-dev/Modmail/blob/master/bot.py
-            if isinstance(error, (commands.BadArgument, commands.BadUnionArgument)):
-                await ctx.typing()
-                await ctx.send(
-                    embed=discord.Embed(
-                        color=ctx.bot.error_color, description=str(error)
-                    )
-                )
-            elif isinstance(error, commands.CommandNotFound):
-                print("CommandNotFound: %s", error)
-            elif isinstance(error, commands.MissingRequiredArgument):
-                await ctx.send_help(ctx.command)
-            elif isinstance(error, commands.CheckFailure):
-                for check in ctx.command.checks:
-                    if not await check(ctx):
-                        if hasattr(check, "fail_msg"):
-                            await ctx.send(
-                                embed=discord.Embed(
-                                    color=ctx.bot.error_color,
-                                    description=check.fail_msg,
-                                )
-                            )
-                        if hasattr(check, "permission_level"):
-                            corrected_permission_level = ctx.bot.command_perm(
-                                ctx.command.qualified_name
-                            )
-                            print(
-                                "User %s does not have permission to use this command: `%s` (%s).",
-                                ctx.author.name,
-                                ctx.command.qualified_name,
-                                corrected_permission_level.name,
-                            )
-                print("CheckFailure: %s", error)
-            elif isinstance(error, commands.DisabledCommand):
-                print(
-                    "DisabledCommand: %s is trying to run eval but it's disabled",
-                    ctx.author.name,
-                )
-            elif isinstance(error, commands.CommandInvokeError):
-                await ctx.send(
-                    embed=discord.Embed(
-                        color=ctx.bot.error_color,
-                        description=f"{str(error)}\nYou might be getting this error during **getinfo** if the user is either\n1. Not in the `main` server\n2. Has no linked account in bloxlink",
-                    )
-                )
-            else:
-                await ctx.channel.send(f"{error}, {type(error)}")
-                print("Unexpected exception:", error)
-
-            try:
-                await ctx.message.clear_reactions()
-                await ctx.message.add_reaction("⛔")
-            except Exception:
-                pass
-
-    @commands.command()
-    async def initdb(self, ctx):
-        if self.db_generated is False:
-            pool = await create_database()
-            self.bot.pool = pool
-            await ctx.reply("Generated postgres pool")
-            self.db_generated = True
-        else:
-            await ctx.reply("Postgres pool is already generated")
-
-    @core.checks.thread_only()
-    @core.checks.has_permissions(core.models.PermissionLevel.SUPPORTER)
-    @commands.dynamic_cooldown(new_cooldown, type=commands.BucketType.user)
-    @commands.command()
-    async def claim(self, ctx, bypass: str = None):
-        time = ctx.channel.created_at
-        time = time.replace(tzinfo=timezone.utc)
-
-        time_now = datetime.now(timezone.utc)
-
-        diff = (time_now - time).total_seconds() * 1000
-
-        timing = random.randint(1000, 1500)
-
-        if diff < timing:
-            return await ctx.channel.send("Too fast, please try again")
-
-        day = await count_user_tickets_today(self.bot.pool, ctx.author.id)
-
-        if (day == 8) and (bypass != "bypass"):
-            embed = EmbedMaker(
-                ctx,
-                title="You have done 8 tickets today",
-                description=f"You've done 8 tickets today! Doing more will cause management to be notified. However if you wish to claim it run `.claim bypass`",
-                colour="red",
-            )
-            return await ctx.send(embed=embed)
-
-        thread = await self.db.find_one({"thread_id": str(ctx.thread.channel.id)})
-        if thread is None:
-            await self.db.insert_one(
-                {
-                    "thread_id": str(ctx.thread.channel.id),
-                    "claimer": str(ctx.author.id),
-                    "original_name": ctx.channel.name,
-                }
-            )
-
-            try:
-                nickname = ctx.author.display_name
-                await ctx.channel.edit(
-                    name=f"claimed-{nickname}"
-                )  # pls dont abuse this
-
-                embed = EmbedMaker(
-                    ctx,
-                    title="Claimed",
-                    description=f"Claimed by {ctx.author.mention}",
-                    colour="green",
-                )
-                await ctx.message.channel.send(embed=embed)
-
-            except discord.errors.Forbidden:
-                await ctx.message.reply("I don't have permission to do that")
-        else:
-            claimer = thread["claimer"]
-            embed = EmbedMaker(
-                ctx,
-                title="Already Claimed",
-                description=f"Already claimed by {(f'<@{claimer}>') if claimer != ctx.author.id else 'you, dumbass'}",
-                colour="red",
-            )
-            await ctx.send(embed=embed)
-
-    @commands.command()
-    async def tickets(self, ctx, user: discord.Member, days: int):
-        tickets = await get_tickets_in_timeframe(self.bot.pool, user.id, days)
-        return await ctx.reply(
-            f"{tickets} {'tickets' if tickets > 1 else 'ticket'} in last {days} days"
-        )
-
-    @core.checks.thread_only()
-    @core.checks.has_permissions(core.models.PermissionLevel.SUPPORTER)
-    @commands.command()
-    async def unclaim(self, ctx):
-        thread = await self.db.find_one({"thread_id": str(ctx.thread.channel.id)})
-        if thread is None:
-            embed = EmbedMaker(
-                ctx,
-                title="Already Unclaimed",
-                description="This thread is not claimed, you can claim it!",
-            )
-            return await ctx.message.reply(embed=embed)
-
-        if thread["claimer"] == str(ctx.author.id):
-            await self.db.find_one_and_delete({"thread_id": str(ctx.thread.channel.id)})
-
-            try:
-                embed = EmbedMaker(
-                    ctx,
-                    title="Unclaimed",
-                    description=f"Unclaimed by {ctx.author.mention}",
-                    colour="green",
-                )
-
-                await ctx.channel.edit(name=thread["original_name"])
-
-                await ctx.message.reply(embed=embed)
-
-            except discord.errors.Forbidden:
-                await ctx.message.reply("I don't have permission to do that")
-        else:
-            e = discord.Embed(
-                title="Unclaim Denied",
-                description=f"You're not the claimer of this thread, don't anger chairwoman abbi",
-            )
-            await ctx.message.reply(embed=e)
-
-    @core.checks.has_permissions(core.models.PermissionLevel.MODERATOR)
-    @commands.command()
-    async def export(self, ctx):
-        await ctx.message.add_reaction("<a:loading_f:1249799401958936576>")
-        file = await rank_users_by_tickets_this_month_to_csv(self.bot.pool, ctx)
-        await ctx.message.clear_reactions()
-        with open(file, "rb") as f:
-            await ctx.send(file=discord.File(f, filename=file))
-
-    @core.checks.thread_only()
-    @core.checks.has_permissions(core.models.PermissionLevel.SUPPORTER)
-    @commands.command()
-    async def takeover(self, ctx):
-
-        if ctx.channel.id in self.bot.frozen:
-            return await ctx.channel.send("Channel is frozen")
-
-        roles_taker = [str(i.id) for i in ctx.author.roles]
-        roles_to_take_t = []
-        for i in range(len(roles_taker)):
-            if roles_taker[i] not in ROLE_HIERARCHY:
-                roles_to_take_t.append(roles_taker[i])
-
-        for i in roles_to_take_t:
-            roles_taker.remove(i)
-
-        # await asyncio.sleep(1)
-        thread = await self.db.find_one({"thread_id": str(ctx.thread.channel.id)})
-
-        if thread["claimer"] == str(ctx.author.id):
-            embed = EmbedMaker(
-                ctx,
-                title="Takeover Denied",
-                description=f"You have literally claimed this yourself tf u doing",
-                colour="red",
-            )
-            await ctx.channel.send(embed=embed)
-            return
-
-        mem = ctx.guild.get_member(thread["claimer"])
-
-        if mem is None:
-            mem = await ctx.guild.fetch_member(thread["claimer"])
-
-        roles_claimed = [str(i.id) for i in mem.roles]
-
-        roles_to_take_c = []
-        for i in range(len(roles_claimed)):
-            if roles_claimed[i] not in ROLE_HIERARCHY:
-                roles_to_take_c.append(roles_claimed[i])
-
-        for i in roles_to_take_c:
-            roles_claimed.remove(i)
-
-        if (ROLE_HIERARCHY.index(roles_taker[-1]) < ROLE_HIERARCHY.index(roles_claimed[-1])) or (ctx.author.id in BYPASS_LIST):
-            await self.db.find_one_and_update(
-                {"thread_id": str(ctx.thread.channel.id)},
-                {"$set": {"claimer": str(ctx.author.id)}},
-            )
-            e = EmbedMaker(
-                ctx,
-                title="Taken over succesfully",
-                description=f"Takeover by <@{ctx.author.id}> successful, they now own the ticket. Channel name change can take up to 5 minutes",
-            )
-            await ctx.channel.send(embed=e)
-            try:
-                nickname = ctx.author.display_name
-                await ctx.channel.edit(name=f"claimed-{nickname}")
-            except discord.errors.Forbidden:
-                await ctx.message.reply("I couldn't change the channel name sorry")
-        else:
-            e = EmbedMaker(
-                ctx,
-                title="Takeover Denied",
-                description=f"Takeover denied since the claimer is your superior or the same rank as you, if you need to takeover and this is not letting you, ask management for a manual transfer.",
-            )
-            await ctx.reply(embed=e)
+        # Add checks to commands
+        for cmd_name in ['reply', 'areply', 'fareply', 'freply', 'close']:
+            cmd = self.bot.get_command(cmd_name)
+            if cmd:
+                cmd.add_check(check)
 
     async def cog_unload(self):
-        cmds = [
-            self.bot.get_command("reply"),
-            self.bot.get_command("freply"),
-            self.bot.get_command("areply"),
-            self.bot.get_command("fareply"),
-            self.bot.get_command("close"),
-        ]
-        for i in cmds:
-            if check in i.checks:
-                print(f"REMOVING CHECK IN {i.name}")  # Some logging yh
-                i.remove_check(check)
+        """Cleanup when cog is unloaded"""
+        # Remove checks
+        for cmd_name in ['reply', 'areply', 'fareply', 'freply', 'close']:
+            cmd = self.bot.get_command(cmd_name)
+            if cmd and check in cmd.checks:
+                cmd.remove_check(check)
 
-        self.bot.sync_db.close()
-        await self.bot.pool.terminate()
-
-    @commands.command()
-    @is_bypass()
-    async def freeze(self, ctx: commands.Context):
-        if ctx.channel.id not in self.bot.frozen:
-            self.bot.frozen.append(ctx.channel.id)
-
-        await ctx.channel.send("This channel is frozen now, `takeover` is **disabled**, `transfer` is **enabled**.")
-
-    @commands.command()
-    @core.checks.has_permissions(core.models.PermissionLevel.SUPPORTER)
-    async def owns(self, ctx, username, *, gamepass):
-        conversion_gamepass = False
-        conversion_username = False
-
-        try:
-            gamepass = int(gamepass)
-        except Exception:
-            gamepass = gamepass
-            conversion_gamepass = True
-
-        try:
-            username_id = int(username)
-        except Exception:
-            username = username
-            conversion_username = True
-
-        async with aiohttp.ClientSession() as session:
-            if conversion_username is True:
-                async with session.post(
-                    "https://users.roblox.com/v1/usernames/users",
-                    data=json.dumps(
-                        {"usernames": [username], "excludeBannedUsers": True}
-                    ),
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if bool(data["data"]) is False:
-                            e = EmbedMaker(
-                                ctx,
-                                title="Wrong username",
-                                description="Please try putting the right **ROBLOX** username",
-                            )
-                            return await ctx.message.reply(embed=e)
-                        if data["data"][0]["requestedUsername"] != username:
-                            e = EmbedMaker(
-                                ctx,
-                                title="Failed checks",
-                                description="Error Checking, please try again",
-                            )
-                            return await ctx.message.reply(embed=e)
-                        print(data["data"][0]["id"])
-                        username_id = data["data"][0]["id"]
-
-            if conversion_gamepass is True:
-                gamepass_id = find_most_similar(gamepass)
-
-            async with session.get(
-                f"https://inventory.roblox.com/v1/users/{username_id}/items/1/{gamepass_id[1]}/is-owned"
-            ) as resp:
-                if resp.status == 200:
-                    owns = await resp.json()
-
-                    if not isinstance(owns, bool):
-                        if "errors" in owns.keys():
-                            owns = False
-
-                    if owns is True:
-                        e = EmbedMaker(
-                            ctx,
-                            title=f"{EMOJI_VALUES[True]} Ownership Verified",
-                            description=f"{gamepass_id[0]} owned by {username}, [link](https://inventory.roblox.com/v1/users/{username_id}/items/1/{gamepass_id[1]}/is-owned)",
-                        )
-                        return await ctx.message.reply(embed=e)
-                    else:
-                        e = EmbedMaker(
-                            ctx,
-                            title=f"{EMOJI_VALUES[False]} Gamepass NOT Owned",
-                            description=f"{gamepass_id[0]} **NOT** owned by {username}, [link](https://inventory.roblox.com/v1/users/{username_id}/items/1/{gamepass_id[1]}/is-owned)",
-                        )
-                        return await ctx.message.reply(embed=e)
-
-    @commands.command()
-    @core.checks.thread_only()
-    async def getinfo(self, ctx, member: discord.Member = None):
-        await ctx.message.add_reaction("<a:loading_f:1249799401958936576>")
-
-        if member is None:
-            m_id = ctx.thread.recipient.id
-        else:
-            m_id = member.id
-        gamepasses_owned = {key: "IDK" for key in gamepasses.keys()}
-
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(
-                    f"https://api.blox.link/v4/public/guilds/788228600079843338/discord-to-roblox/{m_id}",
-                    headers=HEADERS,
-                ) as res:
-                    roblox_data = await res.json()
-                    roblox_id = roblox_data["robloxID"]
-
-                    # await ctx.channel.send(roblox_data)
-
-                    avatar_url_get = roblox_data["resolved"]["roblox"]["avatar"][
-                        "bustThumbnail"
-                    ]
-            except Exception as e:
-                raise e
-            async with session.get(avatar_url_get) as res:
-                avatar_url_ = await res.json()
-                avatar_url = avatar_url_["data"][0]["imageUrl"]
-
-            for i in gamepasses_owned.keys():
-                id = gamepasses[i]
-
-                async with session.get(
-                    f"https://inventory.roblox.com/v1/users/{roblox_id}/items/1/{id}/is-owned"
-                ) as res:
-                    owns = await res.json()
-
-                    if not isinstance(owns, bool):
-                        if "errors" in owns.keys():
-                            owns = False
-
-                    if owns is True:
-                        gamepasses_owned[i] = True
-                    else:
-                        gamepasses_owned[i] = False
-
-        # Past Usernames
-        past_usernames = []
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"https://users.roblox.com/v1/users/{roblox_data['robloxID']}/username-history"
-            ) as r:
-                response = await r.json()
-
-                if "errors" in response.keys():
-                    raise KeyError
-
-                past_usernames = [i["name"] for i in response["data"]]
-
-        roblox_name = roblox_data["resolved"]["roblox"]["name"]
-        roblox_display_name = roblox_data["resolved"]["roblox"]["displayName"]
-        roblox_profile_link = roblox_data["resolved"]["roblox"]["profileLink"]
-        roblox_rank_name = roblox_data["resolved"]["roblox"]["groupsv2"]["8619634"][
-            "role"
-        ]["name"]
-        roblox_rank_id = roblox_data["resolved"]["roblox"]["groupsv2"]["8619634"][
-            "role"
-        ]["rank"]
-
-        embed = discord.Embed(
-            title=roblox_name,
-            url=roblox_profile_link,
-            colour=0x8E00FF,
-            timestamp=datetime.now(),
-        )
-
-        msg = ""
-        for i, j in gamepasses_owned.items():
-            msg += f"**{i}**: {EMOJI_VALUES[j]}\n"
-
-        msg.strip()
-
-        embed.add_field(
-            name="Discord",
-            value=f"**ID**: {m_id}\n**Username**: {ctx.thread.recipient.name}\n**Display Name**: {ctx.thread.recipient.display_name}",
-            inline=False,
-        )
-        embed.add_field(
-            name="ROBLOX",
-            value=f"**ID**: {roblox_id}\n**Username**: {roblox_name}\n**Display Name**: {roblox_display_name}\n**Rank In Group**: {roblox_rank_name} ({roblox_rank_id})",
-            inline=False,
-        )
-
-        embed.add_field(
-            name="ROBLOX PAST USERNAMES",
-            value="None" if len(past_usernames) == 0 else "\n".join(past_usernames),
-            inline=False,
-        )
-        embed.add_field(name="Gamepasses", value=msg, inline=False)
-
-        embed.set_thumbnail(url=avatar_url)
-
-        embed.set_footer(
-            text=FOOTER,
-            icon_url="https://cdn.discordapp.com/attachments/1208495821868245012/1249743898075463863/Logo.png?ex=66686a34&is=666718b4&hm=f13b57e1fbd96c14bc8123d0a57980791e0f0db267da9ae39911fe50211406e1&",
-        )
-
-        await ctx.message.clear_reactions()
-
-        await ctx.reply(embed=embed)
-
-    @commands.command()
-    @core.checks.thread_only()
-    @core.checks.has_permissions(core.models.PermissionLevel.SUPPORTER)
-    async def mover(self, ctx):
-        view = DropDownView(DropDownChannels())
-
-        await ctx.send("Choose a channel to move this ticket to", view=view)
-
-    @commands.command()
-    @core.checks.thread_only()
-    @core.checks.has_permissions(core.models.PermissionLevel.SUPPORTER)
-    async def remindme(self, ctx, time: str, *, message: str):
-        embed = EmbedMaker(
-            ctx,
-            title="Remind Me",
-            description=f"I will remind you about {message} in {time}",
-        )
-        m = await ctx.message.reply(embed=embed)
-
-        await asyncio.sleep(convert_to_seconds(time))
-
-        await ctx.channel.send(f"<@{ctx.author.id}>, {message}")
-
-        try:
-            await m.delete()
-            await ctx.author.send(message)
-        except discord.errors.Forbidden:
-            pass
-
-    @commands.command()
-    @core.checks.thread_only()
-    @is_bypass()
-    async def transfer(self, ctx, user: discord.Member):
-        thread = await self.db.find_one({"thread_id": str(ctx.thread.channel.id)})
-
-        if thread["claimer"] == str(user.id):
-            embed = EmbedMaker(
-                ctx,
-                title="Transfer Denied",
-                description=f"<@{user.id}> is the thread claimer",
-            )
-            await ctx.channel.send(embed=embed)
-            return
-
-        await self.db.find_one_and_update(
-            {"thread_id": str(ctx.thread.channel.id)},
-            {"$set": {"claimer": str(user.id)}},
-        )
-        e = EmbedMaker(
-            ctx,
-            title="Transfer",
-            description=f"Transfer by <@{user.id}> successful, this ticket is now theirs.",
-        )
-        await ctx.channel.send(embed=e)
-        try:
-            nickname = user.display_name
-
-            await ctx.channel.edit(name=f"claimed-{nickname}")
-
-            m = await ctx.message.channel.send(
-                f"Successfully renamed, this rename was sponsored by the **guides committee**"
-            )
-
-            await asyncio.sleep(10)
-
-            await m.delete()
-        except Exception as e:
-            return await ctx.message.channel.send(str(e))
+        # Close pool
+        await self.bot.pool.close()
 
     @commands.Cog.listener()
-    async def on_thread_close(
-        self, thread, closer, silent, delete_channel, message, scheduled
-    ):
-        if self.db_generated is False:
-            pool = await create_database()
-            self.bot.pool = pool
-            self.db_generated = True
-
-        channel = closer.dm_channel
-
-        if channel is None:
-            channel = await closer.create_dm()
-
+    async def on_thread_close(self, thread, closer, silent, delete_channel, message, scheduled):
+        """Handle thread closure events"""
         if thread.recipient.id == closer.id:
-            try:
-                return await channel.send(
-                    "You closed your own ticket, it will not count towards your ticket count. A copy of this message is sent to management."
-                )
-            except discord.errors.Forbidden:
-                return
-        await add_tickets(self.bot.pool, closer.id)
+            return await self._handle_self_close(closer)
 
-        week = await count_user_tickets_this_week(self.bot.pool, closer.id)
-        month = await count_user_tickets_this_month(self.bot.pool, closer.id)
-        day = await count_user_tickets_today(self.bot.pool, closer.id)
+        await self.db_manager.add_ticket(closer.id)
+        await self._send_close_statistics(closer)
 
-        cooldown = await get_cooldown_time(self.bot.pool, closer.id, True)
-
-        random_number = random.randint(0, 10)
-
+    async def _handle_self_close(self, closer: discord.Member) -> None:
+        """Handle when a user closes their own ticket"""
         try:
+            channel = closer.dm_channel or await closer.create_dm()
             await channel.send(
-                f"Congratulations on closing your ticket {closer}. This is your ticket number `{day}` today, your ticket"
-                f" number `{week}` this week and your ticket number `{month}` this month. Your cooldown "
-                f"is: `{cooldown:.1f}` seconds"
+                "You closed your own ticket, it will not count towards your ticket count. "
+                "A copy of this message is sent to management."
             )
-            if str(closer.id) == "1208702357425102880":
+        except discord.Forbidden:
+            self.logger.warning(f"Could not send DM to user {closer.id}")
+
+    async def _send_close_statistics(self, closer: discord.Member) -> None:
+        """Send ticket statistics after closure"""
+        try:
+            channel = closer.dm_channel or await closer.create_dm()
+
+            day_count = await self.db_manager.count_user_tickets(closer.id, 'day')
+            week_count = await self.db_manager.count_user_tickets(closer.id, 'week')
+            month_count = await self.db_manager.count_user_tickets(closer.id, 'month')
+
+            cooldown = await self.cooldown_mapping.get_tickets_and_cooldown(closer.id)
+            cooldown_time = cooldown[1]
+
+            await channel.send(
+                f"Congratulations on closing your ticket {closer}. This is your ticket number `{day_count}` today, "
+                f"your ticket number `{week_count}` this week and your ticket number `{month_count}` this month. "
+                f"Your cooldown is: `{cooldown_time:.1f}` seconds"
+            )
+
+            if day_count >= 8:
+                await self._handle_high_ticket_count(closer, day_count, channel)
+
+            if closer.id == 1208702357425102880:  # Special message for Ben
                 await channel.send(
                     "Hi Ben, this is a special message I have in store for when you close a ticket. I just want to "
                     "extend my heartfelt congratulations, because this job you do is impressive."
                 )
 
-            if day == 8:
-                await channel.send(
-                    "⚠**TICKET 8 WARNING**⚠\nClosing your 9th ticket will send a message to management where "
-                    "warnings/strikes/demotions might take place, if you have tickets currently claimed **UNCLAIM THEM**"
-                )
-
-            if day > 8:
-                channelo = await self.bot.fetch_channel(1311111724379672608)
-                await channelo.send(
-                    f"⚠**MORE THAN 8 WARNING**⚠\n<@{closer.id}> closed more than 8 tickets in a day. This is his ticket number `{day}` today"
-                )
-
-            if random_number <= 3:
+            if random.random() <= 0.3:  # 30% chance for motivational quote
                 quote = random.choice(MOTIVATIONAL_QUOTES)
+                embed = discord.Embed(color=colours["light_blue"], description=quote, title="Motivational Quote")
+                await channel.send(embed=embed)
 
-                embed = discord.Embed(
-                    color=colours["light_blue"],
-                    description=quote,
-                    title="Motivational Quote",
+        except discord.Forbidden:
+            self.logger.warning(f"Could not send DM to user {closer.id}")
+
+    async def _handle_high_ticket_count(self, closer: discord.Member, day_count: int,
+                                        channel: discord.DMChannel) -> None:
+        """Handle high ticket count warnings"""
+        if day_count == 8:
+            await channel.send(
+                "⚠**TICKET 8 WARNING**⚠\nClosing your 9th ticket will send a message to management where "
+                "warnings/strikes/demotions might take place, if you have tickets currently claimed **UNCLAIM THEM**"
+            )
+        elif day_count > 8:
+            warning_channel = await self.bot.fetch_channel(1311111724379672608)
+            await warning_channel.send(
+                f"⚠**MORE THAN 8 WARNING**⚠\n<@{closer.id}> closed more than 8 tickets in a day. "
+                f"This is their ticket number `{day_count}` today"
+            )
+
+    @commands.dynamic_cooldown(lambda ctx: ctx.cog.cooldown_mapping.get_cooldown(ctx), commands.BucketType.user)
+    @core.checks.thread_only()
+    @core.checks.has_permissions(core.models.PermissionLevel.SUPPORTER)
+    @commands.command()
+    async def claim(self, ctx: commands.Context, bypass: str = None):
+        """Claim a thread"""
+        # Check claim timing
+        created_time = ctx.channel.created_at.replace(tzinfo=timezone.utc)
+        time_diff = (datetime.now(timezone.utc) - created_time).total_seconds() * 1000
+
+        if time_diff < random.randint(1000, 1500):
+            return await ctx.channel.send("Too fast, please try again")
+
+        # Check daily limit
+        day_count = await self.db_manager.count_user_tickets(ctx.author.id, 'day')
+        if day_count == 8 and bypass != "bypass":
+            embed = EmbedMaker(
+                ctx,
+                title="You have done 8 tickets today",
+                description="You've done 8 tickets today! Doing more will cause management to be notified. "
+                            "However if you wish to claim it run `.claim bypass`",
+                colour="red"
+            )
+            return await ctx.send(embed=embed)
+
+        # Check if thread is already claimed
+        thread = await self.thread_manager.get_thread(str(ctx.thread.channel.id))
+        if thread is not None:
+            claimer = thread["claimer"]
+            embed = EmbedMaker(
+                ctx,
+                title="Already Claimed",
+                description=f"Already claimed by {(f'<@{claimer}>') if claimer != str(ctx.author.id) else 'you, dumbass'}",
+                colour="red"
+            )
+            return await ctx.send(embed=embed)
+
+        # Claim the thread
+        await self.thread_manager.claim_thread(
+            str(ctx.thread.channel.id),
+            str(ctx.author.id),
+            ctx.channel.name
+        )
+
+        try:
+            await ctx.channel.edit(name=f"claimed-{ctx.author.display_name}")
+            embed = EmbedMaker(
+                ctx,
+                title="Claimed",
+                description=f"Claimed by {ctx.author.mention}",
+                colour="green"
+            )
+            await ctx.send(embed=embed)
+        except discord.Forbidden:
+            await ctx.reply("I don't have permission to do that")
+
+    @core.checks.thread_only()
+    @core.checks.has_permissions(core.models.PermissionLevel.SUPPORTER)
+    @commands.command()
+    async def unclaim(self, ctx: commands.Context):
+        """Unclaim a thread"""
+        thread = await self.thread_manager.get_thread(str(ctx.thread.channel.id))
+
+        if thread is None:
+            embed = EmbedMaker(
+                ctx,
+                title="Already Unclaimed",
+                description="This thread is not claimed, you can claim it!"
+            )
+            return await ctx.reply(embed=embed)
+
+        if thread["claimer"] != str(ctx.author.id):
+            embed = EmbedMaker(
+                ctx,
+                title="Unclaim Denied",
+                description="You're not the claimer of this thread, don't anger chairwoman abbi"
+            )
+            return await ctx.reply(embed=embed)
+
+        await self.thread_manager.unclaim_thread(str(ctx.thread.channel.id))
+
+        try:
+            await ctx.channel.edit(name=thread["original_name"])
+            embed = EmbedMaker(
+                ctx,
+                title="Unclaimed",
+                description=f"Unclaimed by {ctx.author.mention}",
+                colour="green"
+            )
+            await ctx.reply(embed=embed)
+        except discord.Forbidden:
+            await ctx.reply("I don't have permission to do that")
+
+    @core.checks.thread_only()
+    @core.checks.has_permissions(core.models.PermissionLevel.SUPPORTER)
+    @commands.command()
+    async def takeover(self, ctx: commands.Context):
+        """Take over a thread from another user"""
+        if ctx.channel.id in self._frozen:
+            return await ctx.send("Channel is frozen")
+
+        thread = await self.thread_manager.get_thread(str(ctx.thread.channel.id))
+        if thread["claimer"] == str(ctx.author.id):
+            embed = EmbedMaker(
+                ctx,
+                title="Takeover Denied",
+                description="You have literally claimed this yourself tf u doing",
+                colour="red"
+            )
+            return await ctx.send(embed=embed)
+
+        # Get role hierarchies
+        taker_roles = [str(r.id) for r in ctx.author.roles if str(r.id) in ROLE_HIERARCHY]
+        try:
+            claimer = await ctx.guild.fetch_member(int(thread["claimer"]))
+            claimed_roles = [str(r.id) for r in claimer.roles if str(r.id) in ROLE_HIERARCHY]
+        except discord.NotFound:
+            claimed_roles = []
+
+        # Check if can takeover
+        can_takeover = (
+                not claimed_roles or
+                ROLE_HIERARCHY.index(taker_roles[-1]) < ROLE_HIERARCHY.index(claimed_roles[-1]) or
+                ctx.author.id in BYPASS_LIST
+        )
+
+        if can_takeover:
+            await self.thread_manager.transfer_thread(str(ctx.thread.channel.id), str(ctx.author.id))
+            try:
+                await ctx.channel.edit(name=f"claimed-{ctx.author.display_name}")
+                embed = EmbedMaker(
+                    ctx,
+                    title="Taken over successfully",
+                    description=f"Takeover by {ctx.author.mention} successful"
+                )
+                await ctx.send(embed=embed)
+            except discord.Forbidden:
+                await ctx.reply("I couldn't change the channel name sorry")
+        else:
+            embed = EmbedMaker(
+                ctx,
+                title="Takeover Denied",
+                description="Takeover denied since the claimer is your superior or the same rank as you"
+            )
+            await ctx.reply(embed=embed)
+
+    @commands.command()
+    @core.checks.has_permissions(core.models.PermissionLevel.MODERATOR)
+    async def export(self, ctx: commands.Context):
+        """Export monthly ticket rankings to CSV"""
+        await ctx.message.add_reaction("<a:loading_f:1249799401958936576>")
+
+        # Get ranking data
+        results = await self.db_manager.rank_users_monthly()
+        results = [list(i) for i in results]
+
+        time = unix_converter(2.546 * len(results))
+        msg = await ctx.reply(f"Started generation, estimated completion: <t:{time}:R>")
+
+        # Convert Discord IDs to Roblox usernames
+        rm_indices = []
+        for idx, entry in enumerate(results):
+            try:
+                roblox_data = await self.roblox_api.get_user_info(entry[0])
+                if "error" in roblox_data or "resolved" not in roblox_data:
+                    raise ValueError("Invalid response")
+                results[idx][0] = roblox_data["resolved"]["roblox"]["name"]
+            except Exception as e:
+                self.logger.error(f"Error processing user {entry[0]}: {e}")
+                rm_indices.append(idx)
+                await ctx.send(
+                    f"Discord ID: {entry[0]} error, <@{entry[0]}> will not be included in pay, "
+                    f"but if you need their ticket amount it is: `{entry[1]}`"
                 )
 
-                await channel.send(embed=embed)
-        except discord.errors.Forbidden:
+        # Remove failed entries
+        results = [item for idx, item in enumerate(results) if idx not in rm_indices]
+
+        # Write CSV
+        filename = f"monthly_ranking_{uuid.uuid4()}.csv"
+        with open(filename, mode="w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(["ROBLOX Username", "Ticket Count", "Rank"])
+            writer.writerows(results)
+
+        await msg.delete()
+        with open(filename, "rb") as f:
+            await ctx.send(file=discord.File(f, filename=filename))
+
+    @commands.command()
+    @core.checks.thread_only()
+    async def getinfo(self, ctx: commands.Context, member: discord.Member = None):
+        """Get information about a user"""
+        await ctx.message.add_reaction("<a:loading_f:1249799401958936576>")
+
+        user_id = member.id if member else ctx.thread.recipient.id
+
+        try:
+            # Get Roblox data
+            roblox_data = await self.roblox_api.get_user_info(user_id)
+            if "error" in roblox_data:
+                raise ValueError("Failed to get Roblox data")
+
+            roblox_id = roblox_data["robloxID"]
+
+            # Get gamepass ownership
+            gamepass_status = {}
+            for pass_name, pass_id in gamepasses.items():
+                owns = await self.roblox_api.get_gamepass_ownership(roblox_id, pass_id)
+                gamepass_status[pass_name] = owns
+
+            # Get past usernames
+            past_usernames = await self.roblox_api.get_past_usernames(roblox_id)
+
+            # Create embed
+            embed = discord.Embed(
+                title=roblox_data["resolved"]["roblox"]["name"],
+                url=roblox_data["resolved"]["roblox"]["profileLink"],
+                colour=0x8E00FF,
+                timestamp=datetime.now()
+            )
+
+            # Add fields
+            embed.add_field(
+                name="Discord",
+                value=f"**ID**: {user_id}\n**Username**: {ctx.thread.recipient.name}\n"
+                      f"**Display Name**: {ctx.thread.recipient.display_name}",
+                inline=False
+            )
+
+            embed.add_field(
+                name="ROBLOX",
+                value=f"**ID**: {roblox_id}\n"
+                      f"**Username**: {roblox_data['resolved']['roblox']['name']}\n"
+                      f"**Display Name**: {roblox_data['resolved']['roblox']['displayName']}\n"
+                      f"**Rank In Group**: {roblox_data['resolved']['roblox']['groupsv2']['8619634']['role']['name']} "
+                      f"({roblox_data['resolved']['roblox']['groupsv2']['8619634']['role']['rank']})",
+                inline=False
+            )
+
+            if past_usernames:
+                embed.add_field(
+                    name="ROBLOX PAST USERNAMES",
+                    value="\n".join(past_usernames),
+                    inline=False
+                )
+
+            gamepass_text = "\n".join(f"**{name}**: {EMOJI_VALUES[status]}"
+                                      for name, status in gamepass_status.items())
+            embed.add_field(name="Gamepasses", value=gamepass_text, inline=False)
+
+            # Set thumbnail
+            avatar_url = roblox_data["resolved"]["roblox"]["avatar"]["bustThumbnail"]
+            async with aiohttp.ClientSession() as session:
+                async with session.get(avatar_url) as res:
+                    avatar_data = await res.json()
+                    embed.set_thumbnail(url=avatar_data["data"][0]["imageUrl"])
+
+            embed.set_footer(
+                text=FOOTER,
+                icon_url="https://cdn.discordapp.com/attachments/1208495821868245012/1249743898075463863/Logo.png"
+            )
+
+            await ctx.message.clear_reactions()
+            await ctx.reply(embed=embed)
+
+        except Exception as e:
+            await ctx.message.clear_reactions()
+            await ctx.reply(f"Error getting user info: {str(e)}")
+
+    @commands.command()
+    @core.checks.thread_only()
+    @core.checks.has_permissions(core.models.PermissionLevel.SUPPORTER)
+    async def mover(self, ctx: commands.Context):
+        """Move the thread to a different channel"""
+        view = DropDownView()
+        await ctx.send("Choose a channel to move this ticket to", view=view)
+
+    @commands.command()
+    @core.checks.thread_only()
+    @core.checks.has_permissions(core.models.PermissionLevel.SUPPORTER)
+    async def remindme(self, ctx: commands.Context, time: str, *, message: str):
+        """Set a reminder"""
+        embed = EmbedMaker(
+            ctx,
+            title="Remind Me",
+            description=f"I will remind you about {message} in {time}"
+        )
+        m = await ctx.reply(embed=embed)
+
+        await asyncio.sleep(convert_to_seconds(time))
+        await ctx.channel.send(f"{ctx.author.mention}, {message}")
+
+        try:
+            await m.delete()
+            await ctx.author.send(message)
+        except discord.Forbidden:
             pass
 
     @commands.command()
     @is_bypass()
-    async def hi(self, ctx):
-        await ctx.channel.send("Hi there")
+    async def freeze(self, ctx: commands.Context):
+        """Freeze a channel"""
+        if ctx.channel.id not in self._frozen:
+            self._frozen.add(ctx.channel.id)
+        await ctx.send("This channel is frozen now, `takeover` is **disabled**, `transfer` is **enabled**.")
 
+    @commands.command()
+    @core.checks.thread_only()
+    @is_bypass()
+    async def transfer(self, ctx: commands.Context, user: discord.Member):
+        """Transfer a thread to another user"""
+        thread = await self.thread_manager.get_thread(str(ctx.thread.channel.id))
 
-async def wait_for(ctx: discord.ext.commands.Context, time: int, embed: discord.Embed) -> None:
-    await asyncio.sleep(time)
-    await ctx.channel.send()
+        if thread["claimer"] == str(user.id):
+            embed = EmbedMaker(
+                ctx,
+                title="Transfer Denied",
+                description=f"{user.mention} is already the thread claimer"
+            )
+            return await ctx.send(embed=embed)
+
+        await self.thread_manager.transfer_thread(str(ctx.thread.channel.id), str(user.id))
+        try:
+            await ctx.channel.edit(name=f"claimed-{user.display_name}")
+            embed = EmbedMaker(
+                ctx,
+                title="Transfer Successful",
+                description=f"Thread transferred to {user.mention}"
+            )
+            await ctx.send(embed=embed)
+        except discord.Forbidden:
+            await ctx.reply("I couldn't change the channel name")
+
+    async def cog_command_error(self, ctx: commands.Context, error: Exception):
+        """Handle command errors"""
+        if isinstance(error, commands.CommandOnCooldown):
+            embed = EmbedMaker(
+                ctx,
+                title="On Cooldown",
+                description=f"You can use this command again <t:{unix_converter(error.retry_after)}:R>",
+                colour="red"
+            )
+            await ctx.send(embed=embed)
+            return
+
+        if isinstance(error, (commands.BadArgument, commands.BadUnionArgument)):
+            await ctx.typing()
+            await ctx.send(embed=discord.Embed(color=ctx.bot.error_color, description=str(error)))
+
+        elif isinstance(error, commands.CommandNotFound):
+            print("CommandNotFound: %s", error)
+
+        elif isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send_help(ctx.command)
+
+        elif isinstance(error, commands.CheckFailure):
+            for check in ctx.command.checks:
+                if not await check(ctx):
+                    if hasattr(check, "fail_msg"):
+                        await ctx.send(embed=discord.Embed(
+                            color=ctx.bot.error_color,
+                            description=check.fail_msg
+                        ))
+                    if hasattr(check, "permission_level"):
+                        corrected_permission_level = ctx.bot.command_perm(ctx.command.qualified_name)
+                        print(
+                            "User %s does not have permission to use this command: `%s` (%s).",
+                            ctx.author.name,
+                            ctx.command.qualified_name,
+                            corrected_permission_level.name
+                        )
+            print("CheckFailure: %s", error)
+
+        elif isinstance(error, commands.DisabledCommand):
+            print("DisabledCommand: %s is trying to run eval but it's disabled", ctx.author.name)
+
+        elif isinstance(error, commands.CommandInvokeError):
+            await ctx.send(embed=discord.Embed(
+                color=ctx.bot.error_color,
+                description=f"{str(error)}\nYou might be getting this error during **getinfo** if the user is either\n"
+                            f"1. Not in the `main` server\n2. Has no linked account in bloxlink"
+            ))
+        else:
+            await ctx.channel.send(f"{error}, {type(error)}")
+            print("Unexpected exception:", error)
+
+        try:
+            await ctx.message.clear_reactions()
+            await ctx.message.add_reaction("⛔")
+        except Exception:
+            pass
+
+    @commands.command()
+    @core.checks.has_permissions(core.models.PermissionLevel.SUPPORTER)
+    async def owns(self, ctx: commands.Context, username: str, *, gamepass: str):
+        """Check if a user owns a gamepass"""
+        conversion_gamepass = False
+        conversion_username = False
+
+        try:
+            gamepass = int(gamepass)
+        except ValueError:
+            gamepass = gamepass
+            conversion_gamepass = True
+
+        try:
+            username_id = int(username)
+        except ValueError:
+            username = username
+            conversion_username = True
+
+        async with aiohttp.ClientSession() as session:
+            if conversion_username:
+                async with session.post(
+                        "https://users.roblox.com/v1/usernames/users",
+                        data=json.dumps({"usernames": [username], "excludeBannedUsers": True}),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if not bool(data["data"]):
+                            embed = EmbedMaker(
+                                ctx,
+                                title="Wrong username",
+                                description="Please try putting the right **ROBLOX** username"
+                            )
+                            return await ctx.reply(embed=embed)
+
+                        if data["data"][0]["requestedUsername"] != username:
+                            embed = EmbedMaker(
+                                ctx,
+                                title="Failed checks",
+                                description="Error Checking, please try again"
+                            )
+                            return await ctx.reply(embed=embed)
+
+                        username_id = data["data"][0]["id"]
+
+            if conversion_gamepass:
+                gamepass_id = find_most_similar(gamepass)
+
+            async with session.get(
+                    f"https://inventory.roblox.com/v1/users/{username_id}/items/1/{gamepass_id[1]}/is-owned"
+            ) as resp:
+                if resp.status == 200:
+                    owns = await resp.json()
+
+                    if not isinstance(owns, bool):
+                        if "errors" in owns:
+                            owns = False
+
+                    if owns:
+                        embed = EmbedMaker(
+                            ctx,
+                            title=f"{EMOJI_VALUES[True]} Ownership Verified",
+                            description=f"{gamepass_id[0]} owned by {username}"
+                        )
+                    else:
+                        embed = EmbedMaker(
+                            ctx,
+                            title=f"{EMOJI_VALUES[False]} Gamepass NOT Owned",
+                            description=f"{gamepass_id[0]} **NOT** owned by {username}"
+                        )
+
+                    await ctx.reply(embed=embed)
+
 
 
 async def setup(bot):
     await bot.add_cog(GuidesCommittee(bot))
-
